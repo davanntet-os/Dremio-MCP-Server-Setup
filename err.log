@@ -1,0 +1,11 @@
+Downloading pandas (10.3MiB)
+Downloading polars-runtime-32 (47.6MiB)
+Downloading numpy (15.9MiB)
+Downloading pyarrow (47.8MiB)
+Downloading duckdb (20.5MiB)
+ Downloaded pandas
+ Downloaded numpy
+ Downloaded duckdb
+ Downloaded polars-runtime-32
+ Downloaded pyarrow
+Installed 15 packages in 15ms

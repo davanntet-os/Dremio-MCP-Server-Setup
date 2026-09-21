@@ -1,0 +1,70 @@
+name: dremio-mcp
+
+services:
+  dremio:
+    image: dremio/dremio-oss:latest
+    container_name: dremio
+    ports:
+      - "9047:9047"    # Dremio UI + REST API
+      - "32010:32010"  # Arrow Flight
+      - "45678:45678"  # ODBC/JDBC (Flight SQL)
+    environment:
+      DREMIO_JAVA_OPTS: "-Xmx4G"
+    volumes:
+      - dremio-data:/opt/dremio/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9047/"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+  # One-shot: bootstraps the admin user on first boot and writes a PAT
+  # to the shared volume for dremio-mcp.
+  dremio-init:
+    image: python:3.13-alpine
+    container_name: dremio-init
+    depends_on:
+      dremio:
+        condition: service_healthy
+    environment:
+      DREMIO_URI: http://dremio:9047
+      DREMIO_USER: dremioadmin
+      DREMIO_PASSWORD: dremio123
+      PAT_FILE: /shared/pat.txt
+    volumes:
+      - ./dremio-init.py:/init.py:ro
+      - pat-shared:/shared
+    command: ["python", "/init.py"]
+
+  dremio-mcp:
+    build: ./dremio-mcp
+    container_name: dremio-mcp
+    depends_on:
+      dremio:
+        condition: service_healthy
+      dremio-init:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"    # MCP streamable-HTTP endpoint: http://<host>:8000/mcp
+    environment:
+      DREMIOAI_DREMIO__URI: http://dremio:9047
+      DREMIOAI_DREMIO__PAT: "@/shared/pat.txt"
+      DREMIOAI_TOOLS__SERVER_MODE: FOR_DATA_PATTERNS
+    volumes:
+      - pat-shared:/shared:ro
+    command:
+      - dremio-mcp-server
+      - run
+      - --enable-streaming-http
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --disable-dns-rebinding-protection
+    restart: unless-stopped
+
+volumes:
+  dremio-data:
+  pat-shared:
