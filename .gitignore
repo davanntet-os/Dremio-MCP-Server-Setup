@@ -1,0 +1,8 @@
+# Secrets / local artifacts
+pat.txt
+err.log
+
+# Python
+.venv/
+__pycache__/
+*.pyc

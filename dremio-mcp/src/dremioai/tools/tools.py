@@ -1,0 +1,963 @@
+#
+#  Copyright (C) 2017-2025 Dremio Corporation
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+#
+from contextvars import ContextVar
+from typing import (
+    List,
+    Dict,
+    Any,
+    Optional,
+    Literal,
+    Union,
+    Annotated,
+    ClassVar,
+    get_args,
+    get_type_hints,
+    Callable,
+    Tuple,
+    TypeVar,
+    ParamSpec,
+    Awaitable,
+)
+
+from dataclasses import dataclass, asdict, field
+from datetime import datetime
+from decimal import Decimal
+
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from dremioai import log
+import re
+import functools
+
+import pandas as pd
+import numpy as np
+from dremioai.api.dremio import sql, usage, search, ai_tools
+from dremioai.config import settings
+from dremioai.config.tools import ToolType
+from dremioai.api.prometheus import vm
+from dremioai.api.dremio.catalog import get_schema, get_lineage, get_descriptions
+from dremioai.api.util import run_in_parallel
+from csv import reader
+from io import StringIO
+import json
+from sqlglot import parse_one
+from sqlglot import expressions
+from mcp.types import CallToolResult, TextContent
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import AccessToken
+from dremioai.metrics.tool_metrics import (
+    invocation_counter,
+    invocation_duration,
+    tool_response_bytes,
+    tool_result_errors,
+    sql_result_pages_fetched,
+    sql_result_response_bytes,
+    sql_result_returned_rows,
+    sql_result_total_rows,
+    sql_result_truncations,
+)
+from dremioai.config.feature_flags import FeatureFlagManager
+
+logger = log.logger(__name__)
+
+# Type variables for the secured decorator
+P = ParamSpec("P")
+T = TypeVar("T")
+
+
+@dataclass
+class Property:
+    type: Optional[str] = "string"
+    description: Optional[str] = ""
+
+
+@dataclass
+class Parameters:
+    # parameters: Optional[Dict[str, Parameter]] = field(default_factory=dict)
+    type: Optional[str] = "object"
+    properties: Optional[Dict[str, Property]] = field(default_factory=dict)
+    required: Optional[List[str]] = field(default_factory=list)
+
+
+@dataclass
+class Function:
+    name: str
+    description: str
+    parameters: Parameters
+
+
+@dataclass
+class Tool:
+    """
+    A wrapper for integrating the same tool with LangChain based tool calling agents.
+    """
+
+    type: Optional[str] = "function"
+    function: Optional[Function] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        if not self.function.parameters.properties:
+            del d["function"]["parameters"]
+        return d
+
+
+class Tools:
+    # Set to True in subclasses whose description should be refreshed on every
+    # list_tools() call (e.g. because it embeds live server-side information).
+    dynamic_description: ClassVar[bool] = False
+
+    async def invoke(self):
+        raise NotImplementedError("Subclasses should implement this method")
+
+    async def get_description(self) -> str:
+        """Return the description for this tool.
+
+        Override in subclasses that need to generate a description dynamically
+        at list_tools() time (e.g. based on live server data or feature-flag
+        state).  The default implementation returns the raw docstring of the
+        ``invoke`` method and is never called during server init.
+        """
+        return type(self).__dict__.get("invoke", None).__doc__ or ""
+
+
+def _json_safe_value(value: Any) -> Any:
+    if value is None or value is pd.NA or value is pd.NaT:
+        return None
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).decode("utf-8", errors="replace")
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    if isinstance(value, (pd.Timedelta,)):
+        return str(value)
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _df_to_json_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    if df.empty:
+        return []
+    df = df.where(pd.notnull(df), None)
+    records = df.to_dict(orient="records")
+    return [
+        {key: _json_safe_value(value) for key, value in row.items()} for row in records
+    ]
+
+
+def _json_safe_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: _json_safe_value(value) for key, value in row.items()}
+
+
+def _json_payload_bytes(payload: Any) -> int:
+    try:
+        rendered = json.dumps(
+            payload, ensure_ascii=False, default=_json_safe_value
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        rendered = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    return len(rendered)
+
+
+def _call_tool_result(
+    payload: Dict[str, Any], *, is_error: bool, include_structured: bool = True
+) -> CallToolResult:
+    return CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text=json.dumps(
+                    payload, ensure_ascii=False, indent=2, default=_json_safe_value
+                ),
+            )
+        ],
+        structuredContent={"result": payload} if include_structured else None,
+        isError=is_error,
+    )
+
+
+def _tool_result_bytes(result: Any) -> int:
+    if isinstance(result, CallToolResult):
+        return _json_payload_bytes(result.model_dump(mode="json", by_alias=True))
+    return _json_payload_bytes(result)
+
+
+def _tool_result_is_error(result: Any) -> bool:
+    if isinstance(result, CallToolResult):
+        return result.isError
+    if isinstance(result, dict):
+        return bool(result.get("error"))
+    return False
+
+
+class ProjectIdMiddleware:
+    pat = re.compile(r"^/mcp/([\da-z-]+)(/?.*)")
+    logger = log.logger("ProjectIdMiddleware")
+
+    # ContextVar is per-async-task so each request gets its own project_id
+    project_id_context: ContextVar[str | None] = ContextVar("project_id", default=None)
+    # Trailing path after /mcp/{project_id}, e.g. "/messages" or "" for the root
+    path_remaining_context: ContextVar[str] = ContextVar("path_remaining", default="")
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    @classmethod
+    def get_project_id(cls) -> Optional[str]:
+        return cls.project_id_context.get()
+
+    @classmethod
+    def get_remaining(cls) -> str:
+        """Return the path segment that follows /mcp/{project_id}, e.g. '/messages' or ''."""
+        return cls.path_remaining_context.get()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            ProjectIdMiddleware.logger.info(f"Request {path}")
+            if m := ProjectIdMiddleware.pat.search(path):
+                project_id = m.group(1)
+                ProjectIdMiddleware.project_id_context.set(project_id)
+                FeatureFlagManager.set_project_id(project_id)
+                # Modify scope in-place so the MCP handler sees /mcp[/...].
+                # BaseHTTPMiddleware cannot do this: Starlette 1.0 call_next
+                # captures the original scope via closure and ignores any
+                # request.scope changes made in dispatch().
+                remaining = m.group(2).rstrip("/")
+                ProjectIdMiddleware.path_remaining_context.set(remaining)
+                new_path = f"/mcp{remaining}" if remaining else "/mcp"
+                scope["path"] = new_path
+            else:
+                ProjectIdMiddleware.logger.warning(f"Path {path} doesn't match")
+        await self.app(scope, receive, send)
+
+
+# A decorator to ensure a tool that needs to access Dremio runs with the correct token
+# if invoked through streamable HTTP transport _with_ a valid Dremio bearer token
+# It is a no-op if the tool is invoked through stdio transport, as MCP server ensures
+# proper PAT is used for all requests.
+def secured(fn: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
+
+    @functools.wraps(fn)
+    async def _impl(self, *args: P.args, **kw: P.kwargs) -> T:
+        overrides = {}
+        if isinstance((token := get_access_token()), AccessToken):
+            overrides["dremio.pat"] = token.token
+            logger.debug(
+                f"Overriding PAT with token from request: {token.token[:4]}..."
+            )
+
+        if project_id := ProjectIdMiddleware.get_project_id():
+            overrides["dremio.project_id"] = project_id
+            logger.debug(f"Overriding project_id with {project_id}")
+
+        return (
+            await settings.run_with(fn, overrides, (self,) + args, kw)
+            if overrides
+            else await fn(self, *args, **kw)
+        )
+
+    return _impl
+
+
+def with_metrics(fn: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
+    @functools.wraps(fn)
+    async def _impl(self, *args: P.args, **kw: P.kwargs) -> T:
+        project_id = None
+        if dremio := settings.instance().dremio:
+            project_id = dremio.project_id
+        tool_name = self.__class__.__name__
+        invocation_counter.labels(project_id=project_id, tool=tool_name).inc()
+        try:
+            with invocation_duration.labels(
+                project_id=project_id, tool=tool_name
+            ).time():
+                result = await fn(self, *args, **kw)
+            tool_response_bytes.labels(project_id=project_id, tool=tool_name).observe(
+                _tool_result_bytes(result)
+            )
+            if _tool_result_is_error(result):
+                tool_result_errors.labels(
+                    project_id=project_id, tool=tool_name
+                ).inc()
+            return result
+        except Exception:
+            tool_result_errors.labels(project_id=project_id, tool=tool_name).inc()
+            raise
+
+    return _impl
+
+
+def _get_class_var_hints(tool: Tools, name: str) -> bool:
+    if class_var := get_type_hints(tool, include_extras=True).get(name):
+        if cls_args := get_args(class_var):
+            if (annot := get_args(cls_args[0])) and len(annot) == 2:
+                return annot[-1]
+
+
+get_for = lambda tool: _get_class_var_hints(tool, "For")
+get_project_id_required = lambda tool: _get_class_var_hints(tool, "project_id_required")
+
+
+def is_tool_for(
+    tool: Tools, tool_type: ToolType, dremio: settings.Dremio = None
+) -> bool:
+    inst = settings.instance()
+    if dremio is None and inst is not None and inst.dremio is not None:
+        dremio = inst.dremio
+
+    if project_id_required := get_project_id_required(tool):
+        if dremio is not None and dremio.project_id is None:
+            return False
+
+    if (For := get_for(tool)) is not None:
+        if For & ToolType.EXPERIMENTAL and (
+            dremio is None or not dremio.get("enable_search")
+        ):
+            return False
+        return (For & tool_type) != 0  # == tool_type
+    return False
+
+
+class RunSqlQuery(Tools):
+    For: ClassVar[Annotated[ToolType, ToolType.FOR_SELF | ToolType.FOR_DATA_PATTERNS]]
+    _safe = [
+        expressions.Select,
+        expressions.With,
+        expressions.Union,
+    ]
+
+    @staticmethod
+    def ensure_query_allowed(s: str):
+        if settings.instance().dremio.get("allow_dml"):
+            return
+
+        try:
+            q = parse_one(s)
+            if any(isinstance(q, t) for t in RunSqlQuery._safe):
+                return
+        except:
+            if not re.search(
+                r"\b(drop|insert|update|truncate|delete|copy into|alter|create)\b",
+                s,
+                re.IGNORECASE,
+            ):
+                return
+        raise ValueError(
+            "The query contains a DML statement. Only select queries are allowed"
+        )
+
+    @secured
+    @with_metrics
+    async def invoke(
+        self, query: str
+    ) -> CallToolResult:
+        """Run a SQL query on the Dremio cluster and return the results.
+        Ensure that SQL keywords like 'day', 'month', 'count', 'table' etc are enclosed in double quotes.
+        DML statements (INSERT, UPDATE, DELETE, etc.) may or may not be permitted depending on project configuration.
+        If a DML query is not allowed, this will return an error.
+
+        Results are capped at a server-decided response size limit. If the query returns too much
+        data, this tool returns an error instructing the client to retry with a narrower query,
+        for example by selecting fewer columns, filtering more aggressively, aggregating, or
+        fetching the data in stages.
+
+        Args:
+        query: sql query
+        """
+        try:
+            RunSqlQuery.ensure_query_allowed(query)
+        except ValueError:
+            return _call_tool_result(
+                {
+                    "error": "Only SELECT queries are allowed. DML statements are not permitted.",
+                },
+                is_error=True,
+                include_structured=False,
+            )
+        try:
+            tagged_query = f"/* dremioai: submitter={self.__class__.__name__} */\n{query}"
+            dremio_settings = settings.instance().dremio
+            max_bytes = dremio_settings.get("max_result_bytes")
+            if max_bytes is None:
+                max_bytes = 204_800
+
+            qr = await sql.run_query(query=tagged_query, with_guardrails=True)
+            project_id = dremio_settings.project_id
+            sql_result_total_rows.labels(project_id=project_id).observe(qr.total_rows)
+            sql_result_pages_fetched.labels(project_id=project_id).observe(
+                qr.pages_fetched
+            )
+            records = []
+            response_bytes = 0
+            truncation_reason = None
+
+            for row in qr.rows:
+                record = _json_safe_row(row)
+                if max_bytes > 0:
+                    record_bytes = len(json.dumps(record).encode("utf-8"))
+                    if response_bytes + record_bytes > max_bytes:
+                        truncation_reason = "byte_limit"
+                        break
+                    response_bytes += record_bytes
+                records.append(record)
+
+            sql_result_returned_rows.labels(project_id=project_id).observe(len(records))
+            sql_result_response_bytes.labels(project_id=project_id).observe(
+                response_bytes
+            )
+
+            if truncation_reason:
+                sql_result_truncations.labels(
+                    project_id=project_id, reason=truncation_reason
+                ).inc()
+                return _call_tool_result(
+                    {
+                        "error": (
+                            "This query returned too much data. Try again with a "
+                            "different strategy that reduces the selected data, "
+                            "such as adding LIMIT, filtering, or aggregating."
+                        ),
+                        "result": [],
+                        "truncated": True,
+                        "total_rows": qr.total_rows,
+                        "returned_rows": 0,
+                        "truncation_reason": truncation_reason,
+                    },
+                    is_error=True,
+                    include_structured=False,
+                )
+
+            return _call_tool_result(
+                {"result": records}, is_error=False, include_structured=False
+            )
+        except RuntimeError as e:
+            return _call_tool_result(
+                {
+                    "error": str(e),
+                    "message": "The query failed. Please check the syntax and try again",
+                },
+                is_error=True,
+                include_structured=False,
+            )
+
+
+class BuildUsageReport(Tools):
+    For: ClassVar[Annotated[ToolType, ToolType.FOR_SELF]]
+    project_id_required: ClassVar[Annotated[bool, True]]
+
+    @secured
+    @with_metrics
+    async def invoke(
+        self, by: Optional[Literal["PROJECT", "ENGINE"]] = "ENGINE"
+    ) -> Dict[str, Any]:
+        """Build a usage report for the project grouped by engines for the past 7 days
+
+        Hint: This is useful to plot a visualization
+
+        Args:
+            by: grouping the usage by 'PROJECT' or 'ENGINE'
+        """
+        _, projects_usage, engines_usage = await usage.get_consolidated_usage()
+        if by == "PROJECT":
+            return projects_usage.to_dict(orient="records")
+        return {"results": engines_usage.to_dict(orient="records")}
+
+
+class Resource(Tools):
+    @property
+    def resource_path(self):
+        raise NotImplementedError("Subclasses should implement this method")
+
+
+class Hints(Resource):
+    For: ClassVar[Annotated[ToolType, ToolType.FOR_SELF]]
+
+    @property
+    def resource_path(self):
+        return "dremio://hints"
+
+    async def invoke(self) -> Dict[str, str]:
+        """Dremio cluster has few key diminsions that can be used to analyze and optimize the cluster.
+        Looking at the number of jobs and its statistics and failure rates, and overall system usage
+        """
+        return self.invoke.__doc__
+
+
+class GetUsefulSystemTableNames(Tools):
+    For: ClassVar[Annotated[ToolType, ToolType.FOR_SELF | ToolType.FOR_DATA_PATTERNS]]
+
+    async def invoke(self) -> Dict[str, str]:
+        """Gets the names of system tables in the dremio cluster, useful for various analysis.
+        Use Get Schema of Table tool to get the schema of the table"""
+        return {
+            'INFORMATION_SCHEMA."TABLES"': (
+                "Information about tables in this cluster. "
+                "Be sure to filter out SYSTEM_TABLE for looking at user tables. "
+                "You must encapsulate TABLES in double quotes."
+            ),
+            "sys.project.jobs_recent": "Recent job execution history including status, duration, user, and error details.",
+            "sys.project.engines": "Engine configuration and status for the project.",
+            "sys.organization.users": "Organization user information.",
+            'INFORMATION_SCHEMA."COLUMNS"': "Column-level metadata for all tables and views.",
+            'INFORMATION_SCHEMA."VIEWS"': "View definitions and metadata.",
+        }
+
+
+class GetSchemaOfTable(Tools):
+    For: ClassVar[Annotated[ToolType, ToolType.FOR_SELF | ToolType.FOR_DATA_PATTERNS]]
+
+    @secured
+    @with_metrics
+    async def invoke(self, table_name: Union[str | List[str]]) -> Dict[str, Any]:
+        """Gets the schema of the given table.
+
+        Args:
+            table_name: The fully qualified table name. Accepts either:
+              - A dot-separated string: '"source"."schema"."table"'
+              - A list of path components: ["source", "schema", "table"]
+
+        Returns:
+            A dictionary with information about the table. The field "fields" is a list of dictionaries
+            that give column names and types. Optionally :"text" field and "tag" filed can provide more
+            information about the table
+        """
+        if isinstance(table_name, list):
+            if not table_name:
+                return {
+                    "error": "table_name must not be empty. Provide a list of path components, e.g. ['source', 'schema', 'table']."
+                }
+            paths = table_name
+        else:
+            if not table_name or not table_name.strip():
+                return {
+                    "error": 'table_name must not be empty. Provide a dot-separated name, e.g. \'"source"."schema"."table"\'.'
+                }
+            paths = list(reader(StringIO(table_name), delimiter="."))
+        result = await get_schema(paths[0], include_tags=True)
+        if result and "sql" in result:
+            del result["sql"]
+        return result
+
+
+class GetTableOrViewLineage(Tools):
+    For: ClassVar[Annotated[ToolType, ToolType.FOR_SELF | ToolType.FOR_DATA_PATTERNS]]
+
+    @secured
+    @with_metrics
+    async def invoke(self, table_name: Union[str, List[str]]) -> Dict[str, Any]:
+        """Finds the lineage of a table or view in the Dremio cluster
+
+        Args:
+            table_name: name of the table or view, including the schema. Be sure to quote the table name if it contains special characters
+
+        Returns:
+            A json representation with the lineage of the table or view.
+        """
+        try:
+            return await get_lineage(table_name)
+        except Exception as e:
+            logger.error(f"Lineage lookup failed for {table_name}: {e}")
+            return {
+                "error": "Unable to retrieve lineage for the specified table or view.",
+                "message": "The lineage lookup failed. Please verify the table name and try again.",
+            }
+
+
+class SearchTableAndViews(Tools):
+    For: ClassVar[
+        Annotated[
+            ToolType,
+            ToolType.FOR_SELF | ToolType.FOR_DATA_PATTERNS | ToolType.EXPERIMENTAL,
+        ]
+    ]
+    dynamic_description: ClassVar[bool] = True
+
+    @secured
+    async def get_description(self) -> str:
+        base = type(self).__dict__["invoke"].__doc__ or ""
+        if not settings.instance().dremio.get("enable_semantic_layer"):
+            return base
+        descriptions = await ai_tools.get_semantic_layer_tool_descriptions()
+        parts = [
+            base,
+            "\nWhen semantic layer is enabled, this tool additionally enriches results:",
+        ]
+        if sm_desc := descriptions.get("searchMetrics"):
+            parts.append(f"- **searchMetrics**: {sm_desc}")
+        if rel_desc := descriptions.get("getTableRelationships"):
+            parts.append(f"- **getTableRelationships**: {rel_desc}")
+        parts.append(
+            '\nMetric results are included with "result_type": "METRIC".'
+            ' TABLE/VIEW results include a "relationships" key when relationship data is available.'
+            " The search returns at most topN results (default set by dremio.search_topN)."
+        )
+        return "\n".join(parts)
+
+    async def get_relationships(
+        self, path: List[str]
+    ) -> Tuple[List[str], Optional[ai_tools.TableRelationshipsResponse]]:
+        result = await ai_tools.get_relationships(path)
+        if result and not result.is_empty:
+            return path, result
+        return None, None
+
+    async def get_relationships_for_paths(
+        self, paths: List[List[str]]
+    ) -> List[Tuple[List[str], Optional[ai_tools.TableRelationshipsResponse]]]:
+        results = await run_in_parallel(
+            [self.get_relationships(path) for path in paths]
+        )
+        return [(p, r) for p, r in results if r is not None]
+
+    @secured
+    @with_metrics
+    async def invoke(self, query: str, topN: Optional[int] = None) -> Dict[str, Any]:
+        """Runs a semantic search on the Dremio cluster to find tables and views that match
+        the query.  This is not an exhaustive search; at most ``topN`` results are returned
+        (defaults to the server-side ``dremio.search_topN`` setting, which defaults to 10).
+
+        Args:
+            query: The search query describing the data you are looking for.
+            topN: Maximum number of TABLE/VIEW results to return.  Defaults to the
+                  server-side ``dremio.search_topN`` limit.  Cannot exceed that limit.
+
+        Returns:
+            A dict with a "results" key containing
+            1. "table_and_views" key - that has a list of objects that describe the found
+            tables, views, and
+            Each TABLE/VIEW object has "name", "type", "tags", "description", "schema", and optionally
+            "relationships" keys - that tell how this table is related to others.
+            The schema is included so you can avoid a separate GetSchemaOfTable call.
+            2. (when semantic layer is enabled) "metrics" key with list of approved metrics
+            along with their definitions
+            3. "note" key with truncation notice if topN was more than server limit.
+
+        You *must* trust relationships and metrics if available and give it more
+        weight when figuring out which tables/views/objectives you are looking for.
+        """
+        max_results = settings.instance().dremio.get("search_topN")
+        truncated = False
+        if topN is not None:
+            if topN < max_results:
+                max_results = topN
+            else:
+                truncated = True
+
+        enable_semantic = ai_tools.is_semantic_layer_enabled()
+
+        search_tasks = [
+            search.get_search_results(
+                search.Search(query=query, filter=category, maxResults=max_results),
+                use_df=True,
+            )
+            for category in (search.Category.TABLE, search.Category.VIEW)
+        ]
+        if enable_semantic:
+            search_tasks.append(ai_tools.get_metrics(query))
+
+        res = await run_in_parallel(search_tasks)
+        # concat only non-empty DataFrames; both searches may return nothing
+        non_empty = [
+            df for df in res[:2] if isinstance(df, pd.DataFrame) and not df.empty
+        ]
+        table_and_views = pd.concat(non_empty) if non_empty else pd.DataFrame()
+
+        rel_map: Dict[tuple, list] = {}
+        metric_response: Optional[List[ai_tools.Metric]] = None
+        if enable_semantic:
+            metric_response = res[2]
+            # path column holds lists (unhashable) — deduplicate via tuples
+            paths = (
+                table_and_views["path"].dropna().tolist()
+                if "path" in table_and_views.columns
+                else []
+            )
+            relationship_responses: List[ai_tools.TableRelationshipsResponse] = (
+                await self.get_relationships_for_paths(paths)
+            )
+            rel_map = {
+                tuple(path): relationship_response
+                for path, relationship_response in relationship_responses
+                if relationship_response and not relationship_response.is_empty
+            }
+
+        results = []
+        if not table_and_views.empty and "name" in table_and_views.columns:
+            for row in table_and_views.to_dict(orient="records"):
+                path = tuple(row.get("path") or [])
+                if enable_semantic:
+                    if (rels := rel_map.get(path)) and not rels.is_empty:
+                        row["relationships"] = rels.model_dump(exclude_none=True)
+                    else:
+                        row["relationships"] = None
+                results.append(row)
+
+        ret = {"results": {"tables_and_views": results}}
+        if truncated:
+            ret["results"][
+                "NOTE"
+            ] = f"Search results truncated and capped to {max_results}"
+
+        if metric_response and not metric_response.is_empty:
+            ret["results"]["metrics"] = metric_response.model_dump(
+                by_alias=True, exclude_none=True
+            )
+
+        return ret
+
+
+class SearchMetrics(Tools):
+    """Search for metrics in the Dremio semantic layer using a natural-language query."""
+
+    For: ClassVar[Annotated[ToolType, ToolType.DYNAMIC_REMOTE_TOOLS]]
+
+    @secured
+    @with_metrics
+    async def invoke(self, query: str) -> Dict[str, Any]:
+        """Search for metrics in the Dremio semantic layer that match a natural-language query.
+
+        Requires ``enable_semantic_layer`` to be configured.  Returns an empty result when
+        the feature is not enabled.
+
+        Args:
+            query: Natural-language description of the metrics you are looking for.
+
+        Returns:
+            A dict with the metric search results from the Dremio semantic layer.
+        """
+        if not ai_tools.is_semantic_layer_enabled():
+            return {
+                "error": "Semantic layer is not enabled (dremio.enable_semantic_layer)."
+            }
+        result = await ai_tools.invoke_tool("searchMetrics", {"query": query})
+        if result.error:
+            return {"error": result.error}
+        return (
+            result.result
+            if isinstance(result.result, dict)
+            else {"results": result.result}
+        )
+
+
+class GetTableRelationships(Tools):
+    """Retrieve relationship metadata for a table or view from the Dremio semantic layer."""
+
+    For: ClassVar[Annotated[ToolType, ToolType.DYNAMIC_REMOTE_TOOLS]]
+
+    @secured
+    @with_metrics
+    async def invoke(self, path: List[str]) -> Dict[str, Any]:
+        """Retrieve relationship metadata for a table or view in the Dremio semantic layer.
+
+        Requires ``enable_semantic_layer`` to be configured.
+
+        Args:
+            path: The fully-qualified path of the table or view as a list of name components,
+                  e.g. ``["Samples", "my_schema", "my_table"]``.
+
+        Returns:
+            A dict describing the relationships of the specified table or view.
+        """
+        if not ai_tools.is_semantic_layer_enabled():
+            return {
+                "error": "Semantic layer is not enabled (dremio.enable_semantic_layer)."
+            }
+        result = await ai_tools.invoke_tool("getTableRelationShips", {"path": path})
+        if result.error:
+            return {"error": result.error}
+        return (
+            result.result
+            if isinstance(result.result, dict)
+            else {"result": result.result}
+        )
+
+
+class DiscoverDynamicTools(Tools):
+    For: ClassVar[Annotated[ToolType, ToolType.DYNAMIC_REMOTE_TOOLS]]
+
+    @secured
+    @with_metrics
+    async def invoke(self) -> str:
+        """Discover additional tools available from the Dremio server.
+        Call this tool to get a list of dynamically available tools with their
+        names, descriptions, and input schemas."""
+        if not settings.instance().dremio.get("enable_remote_tools"):
+            return "Remote tools are not enabled."
+        result = await ai_tools.list_tools()
+        return result.model_dump_json()
+
+
+class CallDynamicTool(Tools):
+    For: ClassVar[Annotated[ToolType, ToolType.DYNAMIC_REMOTE_TOOLS]]
+
+    @secured
+    @with_metrics
+    async def invoke(self, tool_name: str, tool_arguments: Union[str, dict]) -> str:
+        """Invoke a dynamically discovered tool on the Dremio server.
+
+        Args:
+            tool_name: The name of the tool to invoke, as returned by DiscoverDynamicTools.
+            tool_arguments: The arguments to pass to the tool, either as a JSON string or a dict.
+        """
+        if not settings.instance().dremio.get("enable_remote_tools"):
+            return "Remote tools are not enabled."
+        if isinstance(tool_arguments, str):
+            try:
+                args = json.loads(tool_arguments)
+            except json.JSONDecodeError as exc:
+                return f"Invalid JSON in tool_arguments: {exc}"
+        else:
+            args = tool_arguments
+
+        result = await ai_tools.invoke_tool(tool_name, args)
+        return result.model_dump_json(exclude_none=True)
+
+
+def _subclasses(cls):
+    for sub in cls.__subclasses__():
+        yield from _subclasses(sub)
+        yield sub
+
+
+def get_tools(For: ToolType = None) -> List[Tools]:
+    return [
+        sc
+        for sc in _subclasses(Tools)
+        if sc is not Resource
+        and not issubclass(sc, Resource)
+        and (For is None or is_tool_for(sc, For))
+    ]
+
+
+def get_resources(For: ToolType = None):
+    return [
+        sc
+        for sc in _subclasses(Resource)
+        if sc is not Resource and (For is None or is_tool_for(sc, For))
+    ]
+
+
+def system_prompt():
+    For = settings.instance().tools.server_mode
+    get_tools_prompt = lambda t: "\n\t".join(t.invoke.__doc__.splitlines())
+    all_tools = "\n".join(
+        f"{t.__name__}: {get_tools_prompt(t)}"
+        for t in (get_tools(For) + get_resources(For))
+    )
+
+    return f"""
+    You are helpful AI bot with access to several tools for analyzing Dremio cluster, data, tables and jobs.
+    Note:
+    - In general prefer to illustrate results using interactive graphical plots
+    - Use UNNEST instead of FLATTEN for arrays like queriedDatasets
+    - Use ARRAY_TO_STRING([array], ',') to convert arrays to strings
+    - Make sure to ensure reserved words like count, etc are enclosed in double quotes. You must not quote reserved words if they are input to a function like EXTRACT.
+    - Components in paths to views and tables must be double-quoted.
+    - You must distinguish between user requests that intend to get a result of a SQL query or to generate SQL. The result of the former is the SQL query's result, the result of the latter is a SQL query.
+    - You must use correct SQL syntax, you may use "EXPLAIN" to validate SQL or run it with LIMIT 1 to validate the syntax.
+    - You must use the GetDescriptionOfTableOrSchema tool to get the descriptions of multiple tables and schemas before deciding the relevance.
+    - You must consider views/tables in all search results not just top 1 or 2. The search is not perfect.
+    - Consider sampling rows from multiple tables/views to understand what's in the data before deciding what table to use.
+    - If the user prompt is in non English language, you must first translate it to English before attempting to search. Respond in the language of the user's prompt.
+    - You must check your answer before finalizing the Result.
+    - You must use various SQL select statements to calculate statistics and distribution of columns from the table;
+    - You must use TO_DATE instead of DATE to convert to date type
+    - To create INTERVAL use CAST(1 as INTERVAL DAY); instead of DAY, HOUR, MONTH, MIN can be used as well
+    """
+
+
+class GetRelevantMetrics(Tools):
+    For: ClassVar[Annotated[ToolType, ToolType.FOR_PROMETHEUS]]
+
+    async def invoke(self) -> Dict[str, Any]:
+        """
+        Get the names and descriptions of the relevant prometheus metrics for the Dremio cluster.
+        A metric that shares the same value for label 'daas_dremio_com_coordinator_project_id'
+        belongs to the same project
+
+        Returns: A dictionary with
+            - key: name of the metric
+            - value: description of the metric
+        """
+        return {
+            "jobs_total": "Total number of jobs executed in the Dremio cluster",
+            "jobs_failed_total": "Total number of failed jobs executed in the Dremio cluster",
+            "jobs_command_pool_queue_size": "Total number of jobs queued before planning",
+            "jvm_gc_pause_seconds": "Indicates how long the JVM was paused for garbage collection, and also is a rubric to know if the system is in use",
+            "memory_heap_usage": "Indicates the amount of memory used by the JVM",
+            "memory_heap_committed": "Indicates the amount of memory committed by the JVM",
+            "dremio_engine_executors": "Number of executors running in the Dremio engine. It correlates to dremio_engine_replica_running using engine_id label",
+            "dremio_engine_replica_running": "Number of running replicas in the Dremio engine. It correlates to dremio_engine_executors using engine_id label",
+        }
+
+
+class GetMetricSchema(Tools):
+    For: ClassVar[Annotated[ToolType, ToolType.FOR_PROMETHEUS]]
+
+    async def invoke(self, metric: str) -> Dict[str, Any]:
+        """
+        Given the name of the metric, this will return all the labels you can expect to see
+        for that metric.
+
+        Args:
+          metric: The name of the metric
+
+        Returns: A dictionary with
+            - key: name of the label
+            - value: a sample value of the label
+        """
+        return await vm.get_metrics_schema(metric)
+
+
+class RunPromQL(Tools):
+    For: ClassVar[Annotated[ToolType, ToolType.FOR_PROMETHEUS]]
+
+    async def invoke(self, promql_query: str) -> Dict[str, Any]:
+        """
+        Runs a prometheus query, over the last 7 days and returns the results
+
+        Args:
+          promql_query: The PromQL query to run
+        """
+        df = await vm.get_promql_result(
+            promql_query, start="-7d", step="1h", use_df=True
+        )
+        return df.to_dict(orient="records")
+
+
+class GetDescriptionOfTableOrSchema(Tools):
+    For: ClassVar[Annotated[ToolType, ToolType.FOR_SELF | ToolType.FOR_DATA_PATTERNS]]
+
+    @secured
+    @with_metrics
+    async def invoke(self, name: Union[List[str], str]) -> Dict[str, Any]:
+        """
+        Given one or more table names or schema names, this will return the description of the table or schema, if any exists
+        as well as the description of any parent schemas
+
+        Args:
+          name: The name of the table or schema or a list of names of tables or schemas
+
+        Returns: A dictionary with
+            - key: a part of the table or schema name's heirarchy
+            - value: a dictionary with the description and tags
+        """
+        if isinstance(name, str):
+            name = [name]
+        return await get_descriptions(name)

@@ -1,0 +1,1249 @@
+#
+#  Copyright (C) 2017-2025 Dremio Corporation
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+#
+import asyncio
+import contextlib
+import logging
+import os
+import sys
+import threading
+import time
+from uuid import uuid4
+from enum import StrEnum, auto
+from functools import reduce, wraps
+from http import HTTPStatus
+from json import dump as jdump
+from json import load
+from operator import ior
+from pathlib import Path
+from shutil import which
+from typing import Annotated, Any, Dict, List, Optional, Tuple, Union
+
+import jwt
+import uvicorn
+from click import Choice
+from mcp.cli.claude import get_claude_config_path
+from mcp.server.auth.json_response import PydanticJSONResponse
+from mcp.server.auth.middleware.auth_context import (
+    AuthContextMiddleware,
+    get_access_token,
+)
+from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.fastmcp.prompts import Prompt
+from mcp.server.fastmcp.resources import FunctionResource
+from mcp.server.lowlevel.server import request_ctx
+from mcp.server.streamable_http import (
+    MCP_PROTOCOL_VERSION_HEADER,
+    MCP_SESSION_ID_HEADER,
+)
+from mcp.types import ContentBlock, Tool as MCPTool, ToolAnnotations
+from pydantic import AnyHttpUrl
+from pydantic.networks import AnyUrl
+from rich import console, table
+from rich import print as pp
+from starlette.datastructures import Headers
+from starlette.middleware.authentication import AuthenticationMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.responses import Response as StarletteResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from structlog.contextvars import bound_contextvars
+from typer import Argument, BadParameter, Option, Typer
+from yaml import dump
+
+from dremioai import log
+from dremioai.api.dremio import ai_tools
+from dremioai.api.oauth2 import get_oauth2_tokens
+from dremioai.api.oauth_metadata import (
+    OAuthMetadataRFC8414,
+    OAuthProtectedResourceMetadata,
+)
+from dremioai.config import settings
+from dremioai.config.feature_flags import FeatureFlagManager
+from dremioai.metrics.registry import get_metrics_app
+from dremioai.metrics.tool_metrics import invocation_counter, invocation_duration
+from dremioai.servers.jwks_verifier import JWKSVerifier, TokenExpiredError
+from dremioai.tools import tools
+from dremioai.tools.tools import ProjectIdMiddleware, secured
+
+
+class MCPTransportLoggingMiddleware:
+    logger = log.logger("MCPTransportLoggingMiddleware")
+    status_to_log = HTTPStatus.MULTIPLE_CHOICES  # log 300 and above
+    max_error_body_log_bytes = 2048
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] != "http" or not scope.get("path", "").startswith("/mcp"):
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope)
+        started = time.perf_counter()
+        status_code = None
+        response_headers: List[Tuple[bytes, bytes]] = []
+        captured_body = bytearray()
+        response_body_truncated = False
+
+        async def send_wrapper(message: Message):
+            nonlocal status_code, response_headers, response_body_truncated
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+                response_headers = message.get("headers", [])
+            elif (
+                message["type"] == "http.response.body"
+                and status_code is not None
+                and status_code >= self.status_to_log
+            ):
+                body = message.get("body", b"")
+                remaining = self.max_error_body_log_bytes - len(captured_body)
+                if remaining > 0:
+                    captured_body.extend(body[:remaining])
+                if len(body) > remaining:
+                    response_body_truncated = True
+
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception:
+            self.logger.exception(
+                "MCP transport request failed with exception",
+                duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                **self._request_log_context(request),
+            )
+            raise
+
+        if status_code is not None:
+            event = {
+                "status_code": status_code,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+                "response_mcp_session_id": Headers(raw=response_headers).get(
+                    MCP_SESSION_ID_HEADER
+                ),
+                **self._request_log_context(request),
+            }
+            if status_code >= self.status_to_log:
+                response_body = (
+                    captured_body.decode("utf-8", errors="replace").strip()
+                    if captured_body
+                    else None
+                )
+                self.logger.warning(
+                    "MCP transport request failed",
+                    response_body=response_body,
+                    response_body_truncated=response_body_truncated,
+                    **event,
+                )
+            else:
+                self.logger.info("MCP transport request completed", **event)
+
+    @staticmethod
+    def _request_log_context(request: Request) -> Dict[str, Any]:
+        context = {
+            "method": request.method,
+            "path": request.url.path,
+            "client": request.client.host if request.client else None,
+            "mcp_session_id": request.headers.get(MCP_SESSION_ID_HEADER),
+            "mcp_protocol_version": request.headers.get(MCP_PROTOCOL_VERSION_HEADER),
+            "accept": request.headers.get("accept"),
+            "content_type": request.headers.get("content-type"),
+            "project_id": ProjectIdMiddleware.get_project_id(),
+        }
+        return {key: value for key, value in context.items() if value is not None}
+
+
+class RequireAuthWithWWWAuthenticateMiddleware(BaseHTTPMiddleware):
+    """
+    Custom middleware that requires authentication and returns WWW-Authenticate header
+    for unauthorized requests. This middleware should be placed AFTER AuthenticationMiddleware
+    so that request.user is available.
+    """
+
+    logger = log.logger("RequireAuthWithWWWAuthenticateMiddleware")
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
+        # Check if user is authenticated (request.user is available after AuthenticationMiddleware)
+        if (
+            not hasattr(request, "user")
+            or not request.user.is_authenticated
+            and request.url.path.startswith("/mcp")
+        ):
+            client_host = request.client.host if request.client else "unknown"
+            inst = settings.instance()
+            endpoint = (
+                str(inst.dremio.uri)
+                if inst is not None and inst.dremio is not None and inst.dremio.uri
+                else None
+            )
+            self.logger.warning(
+                "Unauthorized request rejected",
+                path=request.url.path,
+                client=client_host,
+                project_id=ProjectIdMiddleware.get_project_id(),
+                endpoint=endpoint,
+            )
+            # This middleware is the last step that emits the HTTP 401 after the
+            # auth backend has already classified the request as unauthenticated.
+            # RFC 9728 Section 5.1 defines the `resource_metadata` auth-param on
+            # the Bearer challenge so clients can discover the protected resource
+            # metadata document after that 401. If a Bearer token was supplied,
+            # RFC 6750 Section 3.1 allows `error="invalid_token"`, which lets
+            # OAuth-aware MCP clients distinguish "missing token" from "token
+            # rejected upstream by verification/authentication".
+            headers = getattr(request, "headers", {}) or {}
+            has_bearer_token = headers.get("authorization", "").startswith("Bearer ")
+            www_authenticate = (
+                f'Bearer resource_metadata="{build_resource_metadata_url(request)}"'
+            )
+            if has_bearer_token:
+                www_authenticate += ', error="invalid_token"'
+            # Return 401 with WWW-Authenticate header
+            return StarletteResponse(
+                content="Unauthorized",
+                status_code=401,
+                headers={"WWW-Authenticate": www_authenticate},
+            )
+
+        # User is authenticated, proceed with the request
+        return await call_next(request)
+
+
+class Transports(StrEnum):
+    stdio = auto()
+    streamable_http = "streamable-http"
+
+
+def request_base_url(request: Request) -> str:
+    dremio = settings.instance().dremio
+    if dremio is not None and (override := dremio.get("auth_resource_uri_override")):
+        return str(override).rstrip("/")
+
+    headers = getattr(request, "headers", {}) or {}
+    url = getattr(request, "url", None)
+    scheme = getattr(url, "scheme", None) or "http"
+    host = getattr(url, "netloc", None) or getattr(url, "hostname", None)
+    if not host:
+        host = headers.get("host") or "localhost"
+    return f"{scheme}://{host}".rstrip("/")
+
+
+def normalize_resource_path(path: str | None) -> str:
+    if not path:
+        return "/mcp"
+    normalized = "/" + path.lstrip("/")
+    return normalized.rstrip("/") or "/"
+
+
+def protected_resource_path_from_request(
+    request: Request, resource_path: str | None = None
+) -> str | None:
+    if resource_path:
+        return resource_path
+
+    path = getattr(getattr(request, "url", None), "path", "") or ""
+    prefix = "/.well-known/oauth-protected-resource"
+    if path.startswith(prefix):
+        suffix = path[len(prefix) :]
+        return suffix or None
+    return resource_path
+
+
+def build_resource_metadata_url(
+    request: Request, resource_path: str | None = None
+) -> str:
+    if resource_path is None:
+        # ProjectIdMiddleware rewrites /mcp/{project_id}[/...] to /mcp[/...] in-place,
+        # so request.url.path has already lost the project_id by the time this is called.
+        # Use the context vars stored by the middleware to reconstruct the original path.
+        if project_id := ProjectIdMiddleware.get_project_id():
+            resource_path = f"/mcp/{project_id}{ProjectIdMiddleware.get_remaining()}"
+        else:
+            log.logger("build_resource_metadata_url").warning(
+                "No project_id in context; falling back to request path",
+                path=request.url.path,
+            )
+            resource_path = request.url.path
+    return (
+        f"{request_base_url(request)}/.well-known/oauth-protected-resource"
+        f"{normalize_resource_path(resource_path)}"
+    )
+
+
+def build_authorization_server_metadata() -> OAuthMetadataRFC8414 | None:
+    if issuer := settings.instance().dremio.auth_issuer_uri:
+        auth, tok, reg = settings.instance().dremio.auth_endpoints
+        return OAuthMetadataRFC8414(
+            issuer=AnyHttpUrl(issuer),
+            authorization_endpoint=auth,
+            token_endpoint=tok,
+            registration_endpoint=AnyHttpUrl(reg),
+            scopes_supported=["dremio.all", "offline_access"],
+            response_types_supported=["code"],
+            grant_types_supported=["authorization_code", "refresh_token"],
+            code_challenge_methods_supported=["S256"],
+            token_endpoint_auth_methods_supported=["none"],
+        )
+    return None
+
+
+def build_protected_resource_metadata(
+    request: Request,
+    resource_path: str | None = None,
+    auth_metadata: OAuthMetadataRFC8414 | None = None,
+) -> OAuthProtectedResourceMetadata:
+    resource_path = protected_resource_path_from_request(request, resource_path)
+    metadata = {
+        "resource": f"{request_base_url(request)}{normalize_resource_path(resource_path)}"
+    }
+    metadata["authorization_servers"] = [request_base_url(request)]
+    return OAuthProtectedResourceMetadata.model_validate(metadata)
+
+
+class FastMCPServerWithAuthToken(FastMCP):
+    _logger = log.logger("FastMCPServerWithAuthToken")
+
+    class DelegatingTokenVerifier(TokenVerifier):
+        logger = log.logger("DelegatingTokenVerifier")
+
+        def __init__(self):
+            self._jwks_verifier = None
+            dremio = settings.instance().dremio
+            if jwks_uri := dremio.get("jwks_uri"):
+                lifespan = dremio.get("jwks_cache_lifespan") or 3600
+                self._jwks_verifier = JWKSVerifier(jwks_uri, lifespan=lifespan)
+
+        @staticmethod
+        def extract_jwt_aud(token: str) -> str | None:
+            """Extract aud from a JWT without signature verification.
+
+            Used only when ``jwks_uri`` is not configured but
+            ``extract_org_id_from_jwt`` is enabled.
+            """
+            try:
+                claims = jwt.decode(token, options={"verify_signature": False})
+                aud = claims.get("aud")
+                return aud[0] if isinstance(aud, list) else aud
+            except:
+                FastMCPServerWithAuthToken.DelegatingTokenVerifier.logger.exception(
+                    f"Failed to extract org_id from JWT: token={len(token)} bytes"
+                )
+                return None
+
+        async def verify_token(self, token: str) -> AccessToken | None:
+            if not token:
+                self.logger.info("Token not provided")
+                return None
+
+            expires_at = org_id = user_id = None
+            if isinstance(self._jwks_verifier, JWKSVerifier):
+                try:
+                    verified = await self._jwks_verifier.verify(token)
+                except TokenExpiredError:
+                    self.logger.warning(
+                        "Token rejected — JWT has expired",
+                        project_id=ProjectIdMiddleware.get_project_id(),
+                    )
+                    return None
+                if verified:
+                    buffer = settings.instance().dremio.get(
+                        "jwks_token_expiry_buffer_secs"
+                    )
+                    # Subtract the buffer so BearerAuthBackend's
+                    # `if auth_info.expires_at and expires_at < time.time()` guard
+                    # fires this many seconds before Auth0 considers the token expired,
+                    # giving the client's OAuth refresh flow a clean window.
+                    expires_at = (
+                        (verified.exp - buffer) if verified.exp is not None else None
+                    )
+                    org_id = verified.org_id
+                    user_id = verified.user_id
+                    # The actual expiry guard runs in BearerAuthBackend, but we
+                    # return None early here so we can log the rejection with
+                    # context (project_id, user_id) before it disappears silently.
+                    if expires_at is not None and expires_at < int(time.time()):
+                        self.logger.warning(
+                            "Token rejected — past expiry buffer window",
+                            project_id=ProjectIdMiddleware.get_project_id(),
+                            user_id=user_id,
+                        )
+                        return None
+                else:
+                    self.logger.warning(
+                        "JWKS verify() returned None — rejecting token to force reauth",
+                        project_id=ProjectIdMiddleware.get_project_id(),
+                    )
+                    return None
+            elif settings.instance().dremio.get("extract_org_id_from_jwt"):
+                org_id = self.extract_jwt_aud(token)
+
+            if org_id is not None and settings.instance().dremio.get(
+                "extract_org_id_from_jwt"
+            ):
+                FeatureFlagManager.set_org_id(org_id)
+
+            return AccessToken(
+                token=token,
+                client_id=user_id or "unknown",
+                scopes=["read"],
+                expires_at=expires_at,
+            )
+
+    @secured
+    async def _list_remote_tools(self) -> "ai_tools.ListToolsResponse":
+        return await ai_tools.list_tools()
+
+    @secured
+    async def _invoke_remote_tool(
+        self, tool_name: str, args: Dict[str, Any]
+    ) -> "ai_tools.InvokeToolResponse":
+        return await ai_tools.invoke_tool(tool_name, args)
+
+    def expose_remote_tools(self) -> bool:
+        if not settings.instance().dremio.get("enable_remote_tools"):
+            return False
+        mode = settings.instance().tools.server_mode
+        return mode & tools.ToolType.DYNAMIC_REMOTE_TOOLS != 0
+
+    async def list_tools(self) -> list[MCPTool]:
+        static_tools = await super().list_tools()
+
+        # Refresh descriptions for tools that advertise dynamic_description=True.
+        # This is done per-request so the LLM always sees up-to-date server text
+        # (e.g. SearchTableAndViews embeds live semantic-layer tool descriptions).
+        if self._dynamic_description_tools:
+            refreshed = []
+            for t in static_tools:
+                if t.name in self._dynamic_description_tools:
+                    try:
+                        new_desc = await self._dynamic_description_tools[
+                            t.name
+                        ].get_description()
+                        refreshed.append(t.model_copy(update={"description": new_desc}))
+                    except Exception:
+                        self._logger.exception(
+                            "failed to refresh description for tool", tool=t.name
+                        )
+                        refreshed.append(t)
+                else:
+                    refreshed.append(t)
+            static_tools = refreshed
+
+        if not self.expose_remote_tools():
+            return static_tools
+        try:
+            response = await self._list_remote_tools()
+            if response.error:
+                self._logger.warning("remote tool listing failed", error=response.error)
+                return static_tools
+            static_names = {t.name for t in static_tools}
+            remote_tools = []
+            for rt in response.tools:
+                if rt.name in static_names:
+                    self._logger.warning(
+                        "remote tool name collides with static tool, skipping",
+                        name=rt.name,
+                    )
+                    continue
+                remote_tools.append(
+                    MCPTool(
+                        name=rt.name,
+                        description=rt.description,
+                        inputSchema=rt.input_schema,
+                    )
+                )
+            return static_tools + remote_tools
+        except Exception:
+            self._logger.exception("error fetching remote tools")
+            return static_tools
+
+    async def call_tool(
+        self, name: str, arguments: dict
+    ) -> list[ContentBlock] | dict[str, Any]:
+        static_names = {t.name for t in await super().list_tools()}
+        if name in static_names:
+            return await super().call_tool(name, arguments)
+
+        if not self.expose_remote_tools():
+            raise ToolError(f"Tool '{name}' not found (remote tools not enabled)")
+
+        result = await self._invoke_remote_tool(name, arguments)
+        if result.error:
+            raise ToolError(result.error)
+        return result.model_dump(exclude_none=True)
+
+    def streamable_http_app(self):
+        # DX-121842 (Phase 2): The SDK-native auth path (passing token_verifier= and
+        # auth=AuthSettings(...) to FastMCP.__init__ so BearerAuthBackend +
+        # AuthContextMiddleware + RequireAuthMiddleware are injected automatically) was
+        # evaluated and intentionally NOT adopted: request-derived, project-scoped OAuth
+        # discovery (DX-119494); the auth-server shim (DX-117899/DX-114676); and a
+        # middleware-ordering constraint requiring RequireAuthWithWWWAuthenticateMiddleware
+        # to run inside AuthenticationMiddleware. See the DX-121842 PR discussion.
+        if self._mock_token_verifier is not None:
+            token_verifier = self._mock_token_verifier
+        else:
+            token_verifier = FastMCPServerWithAuthToken.DelegatingTokenVerifier()
+        app = super().streamable_http_app()
+        app.add_middleware(RequireAuthWithWWWAuthenticateMiddleware)
+        app.add_middleware(AuthContextMiddleware)
+        app.add_middleware(
+            AuthenticationMiddleware, backend=BearerAuthBackend(token_verifier)
+        )
+        # Starlette inserts middleware at the front, so the last added middleware
+        # runs first. Keep transport logging outermost so it observes auth 401s.
+        if self.support_project_id_endpoints:
+            # this means, dynamically allow endpoints
+            # like ../mcp/{project_id}/..  and extract that project id as
+            # context var
+            app.add_middleware(ProjectIdMiddleware)
+        app.add_middleware(MCPTransportLoggingMiddleware)
+
+        # Metrics are now served on a separate port, not mounted here
+        return app
+
+    async def run_streamable_http_async(self) -> None:
+        """Run StreamableHTTP with Uvicorn access logs disabled.
+
+        FastMCP.run() dispatches here polymorphically for the streamable-http
+        transport, so overriding this method is enough to replace the base
+        Uvicorn configuration used by the CLI server path.
+
+        Access logging is handled by MCPTransportLoggingMiddleware so it can
+        share the application's structured logging pipeline.
+        """
+        starlette_app = self.streamable_http_app()
+        config = uvicorn.Config(
+            starlette_app,
+            host=self.settings.host,
+            port=self.settings.port,
+            log_level=self.settings.log_level.lower(),
+            access_log=False,
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.support_project_id_endpoints = False
+        self._mock_token_verifier = None
+        # Populated by init(): tool name → Tools instance for tools that carry
+        # dynamic_description=True.  list_tools() refreshes their descriptions
+        # per-request so the LLM always sees live server-side text.
+        self._dynamic_description_tools: Dict[str, "tools.Tools"] = {}
+
+
+def _make_mock_invoke(tool_class_name: str, original_doc: str):
+    """Create a mock invoke function that returns a canned response."""
+
+    async def mock_invoke(**kwargs):
+        return {"mock": True, "tool": tool_class_name, "result": []}
+
+    mock_invoke.__doc__ = original_doc
+    return mock_invoke
+
+
+def _mcp_request_log_context() -> Dict[str, Any]:
+    try:
+        ctx = request_ctx.get()
+    except LookupError:
+        return {}
+
+    request = getattr(ctx, "request", None)
+    log_context: Dict[str, Any] = {
+        "jsonrpc_request_id": str(ctx.request_id),
+    }
+    if request is not None:
+        log_context.update(
+            {
+                "mcp_session_id": request.headers.get(MCP_SESSION_ID_HEADER),
+                "mcp_protocol_version": request.headers.get(
+                    MCP_PROTOCOL_VERSION_HEADER
+                ),
+                "client": request.client.host if request.client else None,
+                "method": request.method,
+                "path": request.url.path,
+            }
+        )
+
+    if project_id := ProjectIdMiddleware.get_project_id():
+        log_context["project_id"] = project_id
+
+    if isinstance((token := get_access_token()), AccessToken):
+        log_context["user_id"] = token.client_id
+
+    return {key: value for key, value in log_context.items() if value is not None}
+
+
+def make_logged_invoke(tool_name: str, fn):
+    _log = log.logger("tool_invoke")
+
+    @wraps(fn)
+    async def _wrapper(*args, **kwargs):
+        started = time.perf_counter()
+        log_context = {
+            **_mcp_request_log_context(),
+            "tool": tool_name,
+            "tool_invocation_id": str(uuid4()),
+        }
+        with bound_contextvars(**log_context):
+            try:
+                result = await fn(*args, **kwargs)
+                _log.info(
+                    "Tool invocation completed",
+                    outcome="success",
+                    duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                )
+                return result
+            except Exception as exc:
+                _log.warning(
+                    "Tool invocation raised an exception",
+                    outcome="error",
+                    duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                raise
+
+    return _wrapper
+
+
+def init(
+    mode: Union[tools.ToolType, List[tools.ToolType]] = None,
+    transport: Transports = Transports.stdio,
+    port: int = None,
+    host: str = "127.0.0.1",
+    support_project_id_endpoints: bool = False,
+    mock: bool = False,
+    mock_token_expiry: int = 3600,
+    mock_refresh_token_expiry: int = 86400,
+    disable_dns_rebinding_protection: bool = False,
+) -> FastMCP:
+    mcp_cls = FastMCP if transport == Transports.stdio else FastMCPServerWithAuthToken
+    log.logger("init").info(
+        f"Initializing MCP server with mode={mode}, mock={mock}, class={mcp_cls.__name__}"
+    )
+    opts = {"log_level": "DEBUG", "debug": True, "lifespan": _server_lifespan}
+    if transport == Transports.streamable_http:
+        opts["stateless_http"] = True
+        if disable_dns_rebinding_protection:
+            # SDK 1.14+ auto-enables DNS rebinding protection when bound to
+            # localhost, which rejects any Host header that isn't 127.0.0.1
+            # /localhost/::1. That breaks reverse-proxy and tunneled access
+            # patterns. Auth is enforced separately via OAuth/PAT, so only
+            # disable when explicitly requested via --disable-dns-rebinding-protection.
+            opts["transport_security"] = TransportSecuritySettings(
+                enable_dns_rebinding_protection=False
+            )
+    if port is not None:
+        opts["port"] = port
+    if host is not None:
+        opts["host"] = host
+
+    mcp = mcp_cls("Dremio", **opts)
+    if transport == Transports.streamable_http and support_project_id_endpoints:
+        mcp.support_project_id_endpoints = support_project_id_endpoints
+
+    # In mock mode, set up mock OAuth issuer and token verifier
+    if mock:
+        from dremioai.servers.mock_auth import (
+            MockJWTIssuer,
+            MockTokenVerifier,
+            register_mock_routes,
+        )
+
+        issuer_url = f"http://{host}:{port}" if port else f"http://{host}"
+        mock_issuer = MockJWTIssuer(
+            issuer_url=issuer_url,
+            default_expiry=mock_token_expiry,
+            refresh_token_expiry=mock_refresh_token_expiry,
+        )
+        if isinstance(mcp, FastMCPServerWithAuthToken):
+            mcp._mock_token_verifier = MockTokenVerifier(mock_issuer)
+        register_mock_routes(mcp, mock_issuer)
+
+    mode = reduce(ior, mode) if mode is not None else None
+    allow_dml = settings.instance().dremio.get("allow_dml") if not mock else False
+    for tool in tools.get_tools(For=mode):
+        tool_instance = tool()
+        is_sql_tool = tool is tools.RunSqlQuery
+        if mock:
+            invoke_fn = _make_mock_invoke(tool.__name__, tool_instance.invoke.__doc__)
+        else:
+            invoke_fn = tool_instance.invoke
+        mcp.add_tool(
+            (
+                invoke_fn
+                if mock
+                else make_logged_invoke(tool.__name__, tool_instance.invoke)
+            ),
+            name=tool.__name__,
+            # Use the static docstring at init time.  Tools with
+            # dynamic_description=True have their descriptions refreshed per-
+            # request inside list_tools() using the live server-side text.
+            description=tool_instance.invoke.__doc__ or "",
+            annotations=ToolAnnotations(
+                readOnlyHint=not (is_sql_tool and allow_dml),
+                destructiveHint=bool(is_sql_tool and allow_dml),
+            ),
+            structured_output=False,
+        )
+        if tool_instance.dynamic_description and isinstance(
+            mcp, FastMCPServerWithAuthToken
+        ):
+            mcp._dynamic_description_tools[tool.__name__] = tool_instance
+
+    for resource in tools.get_resources(For=mode):
+        resource_instance = resource()
+        mcp.add_resource(
+            FunctionResource.from_function(
+                resource_instance.invoke,
+                uri=resource_instance.resource_path,
+                name=resource.__name__,
+                description=resource.__doc__,
+                mime_type="application/json",
+            )
+        )
+    # if mode is None or (mode & tools.ToolType.FOR_SELF) != 0:
+    mcp.add_prompt(
+        Prompt.from_function(
+            tools.system_prompt,
+            name="System Prompt",
+            title="System Prompt",
+            description="System-level instructions for Dremio analysis tasks",
+        )
+    )
+
+    if not mock:
+
+        # DX-121842 (Phase 2) re-evaluated replacing the block below with the SDK's native
+        # create_protected_resource_routes; not adopted (see the DX-121842 PR discussion).
+        # FastMCP can expose RFC 9728 metadata from `settings.auth.resource_server_url`,
+        # but this server does not currently populate AuthSettings and also needs the
+        # path-inserted variant derived from the incoming request host/path. RFC 9728
+        # inserts `/.well-known/oauth-protected-resource` ahead of the resource path,
+        # so an MCP endpoint like `/mcp/1234` must publish metadata at
+        # `/.well-known/oauth-protected-resource/mcp/1234` in addition to the root
+        # well-known route.
+        #
+        # DX-119494 is the motivating production case: Langdock custom OAuth app
+        # integrations were timing out after the access token aged out, and the
+        # customer-configured MCP endpoint included `/mcp/<project_id>`. Without the
+        # path-aware protected-resource metadata URL, OAuth clients can miss the
+        # correct discovery target for reauth/refresh on project-scoped MCP resources.
+        @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+        @mcp.custom_route(
+            "/.well-known/oauth-protected-resource/{resource_path:path}",
+            methods=["GET"],
+        )
+        async def protected_resource_metadata(
+            request: Request, resource_path: str = ""
+        ) -> Response:
+            auth_md = build_authorization_server_metadata()
+            return PydanticJSONResponse(
+                build_protected_resource_metadata(request, resource_path, auth_md)
+            )
+
+        @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+        @mcp.custom_route(
+            "/mcp/{project_id}/.well-known/oauth-authorization-server", methods=["GET"]
+        )
+        async def authorization_server_metadata(request: Request) -> Response:
+            if md := build_authorization_server_metadata():
+                return PydanticJSONResponse(md)
+            return Response(status_code=404)
+
+    @mcp.custom_route("/healthz", methods=["GET"])
+    async def health_check(_request: Request) -> Response:
+        """Kubernetes-style health check endpoint"""
+        return Response(content="OK", status_code=200, media_type="text/plain")
+
+    return mcp
+
+
+app = None
+
+
+def create_metrics_server(host: str, port: int, log_level: str) -> uvicorn.Server:
+    # Create a separate uvicorn server for Prometheus metrics.
+    metrics_app = get_metrics_app()
+    config = uvicorn.Config(
+        app=metrics_app,
+        host=host,
+        port=port,
+        log_level=log_level.lower(),
+        access_log=False,
+    )
+    server = uvicorn.Server(config)
+
+    log.logger("metrics_server").info(
+        f"Created metrics server config for {host}:{port}"
+    )
+    return server
+
+
+_SETTINGS_REFRESH_INTERVAL = 60  # seconds
+
+
+async def _settings_refresh_loop():
+    """Periodically reload runtime-mutable settings and sync log level."""
+    _log = log.logger("settings_refresh")
+    while True:
+        await asyncio.sleep(_SETTINGS_REFRESH_INTERVAL)
+        try:
+            s = settings.instance()
+            if s is None:
+                continue
+            # Config reload is typically a small local file read, so blocking the
+            # event loop here would be an edge case. We still offload it to a
+            # worker thread to keep the refresh loop non-blocking if config I/O
+            # ever becomes unexpectedly slow.
+            await asyncio.to_thread(settings.reload_mutable_settings_if_changed)
+            current_settings = settings.instance()
+            level_name = current_settings.get("log_level")
+            logger_names = current_settings.loggers or []
+            level = getattr(logging, level_name.upper(), None)
+            if level is None:
+                continue
+
+            current_scoped_loggers = log.scoped_loggers()
+            if logger_names:
+                if (
+                    level != log.scoped_level()
+                    or logger_names != current_scoped_loggers
+                ):
+                    _log.info(
+                        f"Updating log level to {level_name} for loggers {', '.join(logger_names)}"
+                    )
+                    log.set_level(level, logger_names=logger_names)
+            elif level != log.level() or current_scoped_loggers:
+                _log.info(f"Updating global log level to {level_name}")
+                log.set_level(level)
+        except Exception as e:
+            _log.debug(f"Settings refresh failed: {e}")
+
+
+@contextlib.asynccontextmanager
+async def _server_lifespan(app: FastMCP):
+    """Lifespan context manager that runs background tasks alongside the server."""
+    task = asyncio.create_task(_settings_refresh_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
+def run_with_metrics_server(
+    app: FastMCP, transport: Transports, metrics_server: uvicorn.Server | None = None
+):
+    """
+    Run the main MCP server alongside the metrics server using asyncio.
+
+    Args:
+        app: The FastMCP server instance
+        transport: Transport type
+        metrics_server: Optional metrics server to run concurrently
+    """
+    if metrics_server:
+        # Start metrics server as background task for all transports
+        log.logger("server_startup").info("Starting metrics server as background task")
+
+        threading.Thread(
+            target=lambda: asyncio.run(metrics_server.serve()), daemon=True
+        ).start()
+
+    app.run(transport=transport.value)
+
+
+def _mode() -> List[str]:
+    return [tt.name for tt in tools.ToolType]
+
+
+ty = Typer(context_settings=dict(help_option_names=["-h", "--help"]))
+
+
+@ty.command(name="run", help="Run the DremioAI MCP server")
+def main(
+    config_file: Annotated[
+        Optional[Path],
+        Option("-c", "--cfg", help="The config yaml for various options"),
+    ] = None,
+    log_to_file: Annotated[Optional[bool], Option(help="Log to file")] = True,
+    enable_json_logging: Annotated[
+        Optional[bool], Option(help="Enable JSON logs")
+    ] = False,
+    enable_streaming_http: Annotated[
+        Optional[bool], Option(help="Run MCP as streaming HTTP")
+    ] = False,
+    log_level: Annotated[
+        Optional[str],
+        Option(
+            help="The log level", click_type=Choice(list(logging._nameToLevel.keys()))
+        ),
+    ] = "INFO",
+    port: Annotated[Optional[int], Option(help="The port to listen on")] = None,
+    host: Annotated[
+        Optional[str],
+        Option(help="Where uvicorn listens for requests"),
+    ] = "127.0.0.1",
+    mock: Annotated[
+        Optional[bool],
+        Option(help="Run in mock mode for client sanity testing"),
+    ] = False,
+    mock_token_expiry: Annotated[
+        Optional[int],
+        Option(help="Mock mode: access token expiry in seconds"),
+    ] = 3600,
+    mock_refresh_token_expiry: Annotated[
+        Optional[int],
+        Option(help="Mock mode: refresh token expiry in seconds"),
+    ] = 86400,
+    disable_dns_rebinding_protection: Annotated[
+        Optional[bool],
+        Option(
+            help=(
+                "Disable DNS rebinding protection for the streamable-HTTP transport. "
+                "Use when running behind a reverse proxy or port-forwarding tunnel "
+                "where the Host header differs from 127.0.0.1/localhost."
+            )
+        ),
+    ] = False,
+):
+    log.configure(enable_json_logging=enable_json_logging, to_file=log_to_file)
+    log.set_level(log_level)
+
+    if mock:
+        transport = Transports.streamable_http
+        # In mock mode, create a minimal settings instance — no Dremio config needed
+        settings.set_base_settings(
+            settings.Settings.model_validate(
+                {
+                    "dremio": {
+                        "uri": "http://localhost:9047",
+                        "pat": "mock-pat",
+                    }
+                }
+            ),
+            initialize_ld=True,
+        )
+    else:
+        if enable_streaming_http:
+            transport = Transports.streamable_http
+        else:
+            transport = Transports.stdio
+        settings.configure(config_file)
+        if settings.instance().loggers:
+            configured_level = getattr(
+                logging, settings.instance().get("log_level").upper(), None
+            )
+            if configured_level is not None:
+                log.set_level(
+                    configured_level, logger_names=settings.instance().loggers
+                )
+        dremio = settings.instance().dremio
+        if (
+            dremio.oauth_supported
+            and dremio.oauth_configured
+            and (dremio.oauth2.has_expired or dremio.pat is None)
+        ):
+            oauth = get_oauth2_tokens()
+            oauth.update_settings()
+
+    app = init(
+        mode=settings.instance().tools.server_mode,
+        transport=transport,
+        port=port,
+        host=host,
+        support_project_id_endpoints=True,
+        mock=mock,
+        mock_token_expiry=mock_token_expiry,
+        mock_refresh_token_expiry=mock_refresh_token_expiry,
+        disable_dns_rebinding_protection=disable_dns_rebinding_protection,
+    )
+
+    # Create metrics server based on configuration
+    metrics_server = None
+    if (
+        not mock
+        and settings.instance().dremio.prometheus_metrics_enabled
+        and settings.instance().dremio.prometheus_metrics_port is not None
+    ):
+        metrics_server = create_metrics_server(
+            host=host,
+            port=settings.instance().dremio.prometheus_metrics_port,
+            log_level=log_level,
+        )
+
+    # Run the servers
+    run_with_metrics_server(app, transport, metrics_server)
+
+
+tc = Typer(
+    context_settings=dict(help_option_names=["-h", "--help"]),
+    name="config",
+    help="Configuration management",
+)
+
+
+class ConfigTypes(StrEnum):
+    dremioai = auto()
+    claude = auto()
+
+
+def get_claude_config_path() -> Path:
+    # copy of the function from mcp sdk, but returns the path whether or not
+    # it exists
+    dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"), "Claude")
+    match sys.platform:
+        case "win32":
+            dir = Path(Path.home(), "AppData", "Roaming", "Claude")
+        case "darwin":
+            dir = Path(Path.home(), "Library", "Application Support", "Claude")
+    return dir / "claude_desktop_config.json"
+
+
+@tc.command("list", help="Show default configuration, if it exists")
+def show_default_config(
+    show_filename: Annotated[
+        bool, Option(help="Show the filename for default config file")
+    ] = False,
+    type: Annotated[
+        Optional[ConfigTypes],
+        Option(help="The type of configuration to show", show_default=True),
+    ] = ConfigTypes.dremioai,
+):
+
+    match type:
+        case ConfigTypes.dremioai:
+            dc = settings.default_config()
+            pp(f"Default config file: {dc!s} (exists = {dc.exists()!s})")
+            if not show_filename:
+                settings.configure(dc)
+                pp(
+                    dump(
+                        settings.instance().model_dump(
+                            exclude_none=True,
+                            mode="json",
+                            exclude_unset=True,
+                            by_alias=True,
+                        )
+                    )
+                )
+            pp(f"Default log file: {log.get_log_file()!s}")
+        case ConfigTypes.claude:
+            cc = get_claude_config_path()
+            pp(f"Default config file: '{cc!s}' (exists = {cc.exists()!s})")
+            if not show_filename:
+                jdump(load(cc.open()), sys.stdout, indent=2)
+
+
+cc = Typer(
+    context_settings=dict(help_option_names=["-h", "--help"]),
+    name="create",
+    help="Create DremioAI or LLM configuration files",
+)
+tc.add_typer(cc)
+
+
+def create_default_mcpserver_config() -> Dict[str, Any]:
+    if (uv := which("uv")) is not None:
+        uv = Path(uv).resolve()
+        dir = str(Path(os.getcwd()).resolve())
+        return {
+            "command": str(uv),
+            "args": ["run", "--directory", dir, "dremio-mcp-server", "run"],
+        }
+    else:
+        raise FileNotFoundError("uv command not found. Please install uv")
+
+
+def create_default_config_helper(dry_run: bool):
+    cc = get_claude_config_path()
+    dcmp = {"Dremio": create_default_mcpserver_config()}
+    c = load(cc.open()) if cc.exists() else {"mcpServers": {}}
+    c.setdefault("mcpServers", {}).update(dcmp)
+    if dry_run:
+        pp(c)
+        return
+
+    if not cc.exists():
+        cc.parent.mkdir(parents=True, exist_ok=True)
+
+    with cc.open("w") as f:
+        jdump(c, f)
+        pp(f"Created default config file: {cc!s}")
+
+
+@cc.command("claude", help="Create a default configuration file for Claude")
+def create_default_config(
+    dry_run: Annotated[
+        bool, Option(help="Dry run, do not overwrite the config file. Just print it")
+    ] = False,
+):
+    create_default_config_helper(dry_run)
+
+
+@cc.command("dremioai", help="Create a default configuration file")
+def create_default_config(
+    uri: Annotated[
+        str,
+        Option(
+            help=f"The Dremio URL or shorthand for Dremio Cloud regions ({','.join(settings.DremioCloudUri)})"
+        ),
+    ],
+    pat: Annotated[
+        str,
+        Option(
+            help="The Dremio PAT. If it starts with @ then treat the rest is treated as a filename"
+        ),
+    ],
+    project_id: Annotated[
+        Optional[str],
+        Option(help="The Dremio project id, only if connecting to Dremio Cloud"),
+    ] = None,
+    mode: Annotated[
+        Optional[List[str]],
+        Option("-m", "--mode", help="MCP server mode", click_type=Choice(_mode())),
+    ] = [tools.ToolType.FOR_DATA_PATTERNS.name],
+    enable_search: Annotated[bool, Option(help="Enable semantic search")] = False,
+    oauth_client_id: Annotated[
+        Optional[str],
+        Option(help="The ID of OAuth application, for OAuth2 logon support"),
+    ] = None,
+    dry_run: Annotated[
+        bool, Option(help="Dry run, do not overwrite the config file. Just print it")
+    ] = False,
+):
+    mode = "|".join([tools.ToolType[m.upper()].name for m in mode])
+    dremio = settings.Dremio.model_validate(
+        {
+            "uri": uri,
+            "pat": pat,
+            "project_id": project_id,
+            "enable_search": enable_search,
+            "oauth": (
+                settings.OAuth2.model_validate({"client_id": oauth_client_id})
+                if oauth_client_id
+                else None
+            ),
+        }
+    )
+    ts = settings.Tools.model_validate({"server_mode": mode})
+    settings.configure(settings.default_config(), force=True)
+    settings.instance().dremio = dremio
+    settings.instance().tools = ts
+    if (d := settings.write_settings(dry_run=dry_run)) is not None and dry_run:
+        pp(d)
+    elif not dry_run:
+        pp(f"Created default config file: {settings.default_config()!s}")
+
+
+# --------------------------------------------------------------------------------
+# testing support
+
+tl = Typer(
+    context_settings=dict(help_option_names=["-h", "--help"]),
+    name="tools",
+    help="Support for testing tools directly",
+)
+
+# tl.add_typer(call)
+
+
+@tl.command(
+    name="list",
+    help="List the available tools",
+    context_settings=dict(help_option_names=["-h", "--help"]),
+)
+def tools_list(
+    mode: Annotated[
+        Optional[List[str]],
+        Option("-m", "--mode", help="MCP server mode", click_type=Choice(_mode())),
+    ] = [tools.ToolType.FOR_SELF.name],
+):
+    mode = reduce(ior, [tools.ToolType[m.upper()] for m in mode])
+    tab = table.Table(
+        table.Column("Tool", justify="left", style="cyan"),
+        "Description",
+        "For",
+        title="Tools list",
+        show_lines=True,
+    )
+
+    for tool in tools.get_tools(For=mode):
+        For = tools.get_for(tool)
+        try:
+            tab.add_row(tool.__name__, tool.invoke.__doc__.strip(), For.name)
+        except Exception as e:
+            tab.add_row(tool.__name__, "No Description", For.name)
+    console.Console().print(tab)
+
+
+@tl.command(
+    name="invoke",
+    help="Execute an available tools",
+    context_settings=dict(help_option_names=["-h", "--help"]),
+)
+def tools_exec(
+    tool: Annotated[str, Option("-t", "--tool", help="The tool to execute")],
+    config_file: Annotated[
+        Optional[Path],
+        Option("-c", "--cfg", help="The config yaml for various options"),
+    ] = None,
+    args: Annotated[
+        Optional[List[str]],
+        Argument(help="The arguments to pass to the tool (arg=value ...)"),
+    ] = None,
+):
+    def _to_kw(arg: str) -> Tuple[str, str]:
+        if "=" not in arg:
+            raise BadParameter(f"Argument {arg} is not in the form arg=value")
+        return tuple(arg.split("=", 1))
+
+    settings.configure(config_file)
+
+    if args is None:
+        args = {}
+    elif type(args) == str:
+        args = [args]
+    args = dict(map(_to_kw, args))
+    for_all = reduce(ior, tools.ToolType.__members__.values())
+    all_tools = {t.__name__: t for t in tools.get_tools(for_all)}
+
+    if selected := all_tools.get(tool):
+        tool_instance = selected()  # get arguments from settings
+        result = asyncio.run(tool_instance.invoke(**args))
+        pp(result)
+    else:
+        raise BadParameter(f"Tool {tool} not found")
+
+
+ty.add_typer(tl)
+ty.add_typer(tc)
+
+
+def cli():
+    ty()
+
+
+if __name__ == "__main__":
+    cli()
