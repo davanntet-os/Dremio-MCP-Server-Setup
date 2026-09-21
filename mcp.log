@@ -1,0 +1,7 @@
+Dremio MCP server starting on http://0.0.0.0:8000/mcp
+From Dify (in Docker), use: http://192.168.0.25:8000/mcp
+Press Ctrl+C to stop.
+INFO:     Started server process [65397]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
