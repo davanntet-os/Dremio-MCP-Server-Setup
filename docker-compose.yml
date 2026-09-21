@@ -4,12 +4,9 @@ services:
   dremio-init:
     image: python:3.13-alpine
     container_name: dremio-init
-    depends_on:
-      dremio:
-        condition: service_healthy
     environment:
       DREMIO_URI: http://173.212.237.61:9047
-      DREMIO_USER: amdin
+      DREMIO_USER: admin
       DREMIO_PASSWORD: FatherOfTheYear()12
       PAT_FILE: /shared/pat.txt
     volumes:
@@ -21,12 +18,10 @@ services:
     build: ./dremio-mcp
     container_name: dremio-mcp
     depends_on:
-      dremio:
-        condition: service_healthy
       dremio-init:
         condition: service_completed_successfully
     ports:
-      - "8168:8000"    # MCP streamable-HTTP endpoint: http://<host>:8000/mcp
+      - "8168:8000"    # MCP streamable-HTTP endpoint: http://<host>:8168/mcp
     environment:
       DREMIOAI_DREMIO__URI: http://173.212.237.61:9047
       DREMIOAI_DREMIO__PAT: "@/shared/pat.txt"
@@ -45,5 +40,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  dremio-data:
   pat-shared:
